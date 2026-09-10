@@ -1,1 +1,1 @@
-# tiktok-downloader
+pip install requests pillow
