@@ -1,4 +1,25 @@
+import sys
+import subprocess
+
+# --- Auto-Dependency Installer ---
+REQUIRED_PACKAGES = {
+    "requests": "requests",
+    "pillow": "PIL"
+}
+
+def ensure_dependencies():
+    for package, module_name in REQUIRED_PACKAGES.items():
+        try:
+            __import__(module_name)
+        except ImportError:
+            print(f"Installing missing dependency: {package}...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", package])
+
+ensure_dependencies()
+
+# --- Standard & Third-Party Imports ---
 import io
+import json
 import os
 import re
 import threading
@@ -7,6 +28,10 @@ from tkinter import ttk, filedialog, messagebox
 from urllib.parse import urljoin
 from PIL import Image, ImageTk
 import requests
+
+# --- Config & File Storage ---
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
 
 # --- Palette Setup ---
 BG_DARK = "#121212"
@@ -17,6 +42,9 @@ TEXT_WHITE = "#ffffff"
 TEXT_MUTED = "#a0a0a0"
 BORDER_GRAY = "#2a2a2a"
 
+# Strict regex matching valid http(s) TikTok links
+TIKTOK_URL_REGEX = re.compile(r'https?://(?:[a-zA-Z0-9_-]+\.)*tiktok\.com/[^\s<>"\'`]+')
+
 class TikTokDownloaderApp:
     def __init__(self, root):
         self.root = root
@@ -25,22 +53,44 @@ class TikTokDownloaderApp:
         self.root.resizable(False, False)
         self.root.configure(bg=BG_DARK)
 
-        self.download_dir = tk.StringVar(value=os.path.join(os.path.expanduser("~"), "Downloads"))
+        # Load saved directory or fallback to default
+        initial_path = self._load_saved_path()
+        self.download_dir = tk.StringVar(value=initial_path)
+        
         self.status_text = tk.StringVar(value="Ready • Listening to clipboard")
         self.is_downloading = False
         self.current_video_data = None
         self.last_clipboard = ""
-        self.thumb_photo = None  # Reference to prevent garbage collection
+        self.thumb_photo = None
 
         self._apply_styles()
         self._build_ui()
         self._setup_clipboard_listener()
 
+    def _load_saved_path(self):
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                    saved = cfg.get("download_dir")
+                    if saved and os.path.exists(saved):
+                        return saved
+            except Exception:
+                pass
+        
+        fallback = r"C:\Users\david\shared projects\python\tiktok downloader\random tiktok shit"
+        return fallback if os.path.exists(fallback) else os.path.join(os.path.expanduser("~"), "Downloads")
+
+    def _save_config(self):
+        try:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump({"download_dir": self.download_dir.get()}, f, indent=4)
+        except Exception:
+            pass
+
     def _apply_styles(self):
         style = ttk.Style()
         style.theme_use("clam")
-        
-        # Dark styled progress bar
         style.configure(
             "Cyan.Horizontal.TProgressbar",
             troughcolor=BG_CARD,
@@ -51,7 +101,6 @@ class TikTokDownloaderApp:
         )
 
     def _build_ui(self):
-        # Header
         header_frame = tk.Frame(self.root, bg=BG_DARK)
         header_frame.pack(fill="x", padx=24, pady=(20, 10))
 
@@ -93,8 +142,12 @@ class TikTokDownloaderApp:
         self.preview_card = tk.Frame(self.root, bg=BG_CARD, highlightthickness=1, highlightbackground=BORDER_GRAY)
         self.preview_card.pack(fill="both", expand=True, padx=24, pady=8)
 
-        self.thumb_label = tk.Label(self.preview_card, text="No Video Loaded", fg=TEXT_MUTED, bg="#181818", width=22, height=10)
-        self.thumb_label.pack(side="left", padx=16, pady=16)
+        self.thumb_container = tk.Frame(self.preview_card, width=140, height=190, bg="#181818", highlightthickness=1, highlightbackground=BORDER_GRAY)
+        self.thumb_container.pack_propagate(False)
+        self.thumb_container.pack(side="left", padx=16, pady=16)
+
+        self.thumb_label = tk.Label(self.thumb_container, text="No Preview", fg=TEXT_MUTED, bg="#181818", font=("Segoe UI", 9))
+        self.thumb_label.pack(expand=True, fill="both")
 
         info_frame = tk.Frame(self.preview_card, bg=BG_CARD)
         info_frame.pack(side="left", fill="both", expand=True, padx=(0, 16), pady=16)
@@ -104,7 +157,7 @@ class TikTokDownloaderApp:
 
         self.meta_title = tk.Label(
             info_frame, text="Paste or copy a TikTok link to preview details and media stats.",
-            font=("Segoe UI", 9), fg=TEXT_MUTED, bg=BG_CARD, wraplength=320, justify="left", anchor="nw"
+            font=("Segoe UI", 9), fg=TEXT_MUTED, bg=BG_CARD, wraplength=340, justify="left", anchor="nw"
         )
         self.meta_title.pack(fill="both", expand=True, pady=(6, 6))
 
@@ -158,9 +211,7 @@ class TikTokDownloaderApp:
         self.download_btn.pack(fill="x", padx=24, pady=(8, 20))
 
     def _setup_clipboard_listener(self):
-        # Auto-check clipboard whenever the application window gains focus
         self.root.bind("<FocusIn>", lambda e: self._check_clipboard())
-        # Periodic background check every 2 seconds
         self._check_clipboard_loop()
 
     def _check_clipboard_loop(self):
@@ -171,12 +222,15 @@ class TikTokDownloaderApp:
         try:
             clip = self.root.clipboard_get().strip()
             if clip and clip != self.last_clipboard:
-                if ("tiktok.com" in clip) and clip != self.url_entry.get().strip():
-                    self.last_clipboard = clip
-                    self.url_entry.delete(0, tk.END)
-                    self.url_entry.insert(0, clip)
-                    self.status_text.set("Auto-detected link from clipboard!")
-                    self._fetch_metadata_thread()
+                self.last_clipboard = clip
+                match = TIKTOK_URL_REGEX.search(clip)
+                if match:
+                    valid_url = match.group(0)
+                    if valid_url != self.url_entry.get().strip():
+                        self.url_entry.delete(0, tk.END)
+                        self.url_entry.insert(0, valid_url)
+                        self.status_text.set("Auto-detected link from clipboard!")
+                        self._fetch_metadata_thread()
         except tk.TclError:
             pass
 
@@ -184,6 +238,7 @@ class TikTokDownloaderApp:
         selected = filedialog.askdirectory(initialdir=self.download_dir.get())
         if selected:
             self.download_dir.set(selected)
+            self._save_config()
 
     def _fetch_metadata_worker(self, url):
         try:
@@ -203,12 +258,11 @@ class TikTokDownloaderApp:
             info = data["data"]
             self.current_video_data = info
 
-            # Retrieve & resize cover thumbnail
             cover_url = info.get("cover")
             if cover_url:
                 img_resp = requests.get(cover_url, timeout=10)
                 img_data = Image.open(io.BytesIO(img_resp.content))
-                img_data = img_data.resize((140, 185), Image.Resampling.LANCZOS)
+                img_data = img_data.resize((140, 190), Image.Resampling.LANCZOS)
                 self.thumb_photo = ImageTk.PhotoImage(img_data)
                 self.thumb_label.config(image=self.thumb_photo, text="")
 
@@ -234,7 +288,6 @@ class TikTokDownloaderApp:
     def _download_worker(self, url, out_folder):
         try:
             self.status_text.set("Preparing media stream...")
-            # If not yet fetched, fetch info first
             if not self.current_video_data:
                 resp = requests.post(
                     "https://www.tikwm.com/api/",
